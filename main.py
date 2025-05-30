@@ -23,19 +23,28 @@ from urllib.parse import urlparse, unquote
 import zipfile
 import tempfile
 
+_tk_root = None
+
+def get_tk_root():
+    global _tk_root
+    if _tk_root is None:
+        _tk_root = tk.Tk()
+        _tk_root.withdraw()
+    return _tk_root
+
 def pick_epub_file():
-    root = tk.Tk()
-    root.withdraw()
     file_path = filedialog.askopenfilename(
+        master=get_tk_root(),
         title="Select ePUB file",
         filetypes=[("ePUB files", "*.epub")]
     )
     return file_path
 
 def pick_output_folder():
-    root = tk.Tk()
-    root.withdraw()
-    folder_path = filedialog.askdirectory(title="Select Output Folder")
+    folder_path = filedialog.askdirectory(
+        master=get_tk_root(),
+        title="Select Output Folder"
+    )
     return folder_path
 
 def calculate_end_index(flat_toc, current_index):
@@ -89,57 +98,6 @@ def flatten_toc(toc, level=1, results=None):
 
     return results
 
-def print_toc_tree(toc, level=1, results=None):
-    if results is None:
-        results = []
-
-    for item in toc:
-        if isinstance(item, epub.Link):
-            results.append({'level': level, 'title': item.title, 'href': item.href})
-
-        elif hasattr(item, 'title') and hasattr(item, 'subitems'):
-            title = item.title
-            href = getattr(item, 'href', None)
-
-            if not href and item.subitems:
-                first = item.subitems[0]
-                if isinstance(first, epub.Link):
-                    href = first.href
-                elif hasattr(first, 'href'):
-                    href = getattr(first, 'href', None)
-                elif isinstance(first, tuple) and isinstance(first[0], epub.Link):
-                    href = first[0].href
-
-            results.append({'level': level, 'title': title, 'href': href})
-            flatten_toc(item.subitems, level + 1, results)
-
-        elif isinstance(item, tuple):
-            link_or_title, children = item
-
-            if isinstance(link_or_title, epub.Link):
-                title = link_or_title.title
-                href = link_or_title.href
-            elif hasattr(link_or_title, 'title'):
-                title = link_or_title.title
-                href = getattr(link_or_title, 'href', None)
-            else:
-                title = str(link_or_title)
-                href = None
-
-            if not href and children:
-                first_child = children[0]
-                if isinstance(first_child, epub.Link):
-                    href = first_child.href
-                elif hasattr(first_child, 'href'):
-                    href = getattr(first_child, 'href', None)
-                elif isinstance(first_child, tuple) and isinstance(first_child[0], epub.Link):
-                    href = first_child[0].href
-
-            results.append({'level': level, 'title': title, 'href': href})
-            flatten_toc(children, level + 1, results)
-
-    return results
-
 def print_toc_tree(flat_toc):
     print("\nParsed Table of Contents:\n")
     for i, entry in enumerate(flat_toc):
@@ -188,17 +146,17 @@ def extract_raw_xhtml(epub_path, xhtml_filename):
 
         return raw_content
 
-def link_metadata(book, book_path, new_book, raw_content, entry):
+def link_metadata(book, book_path, split_book, raw_content, entry):
     language = book.get_metadata('DC', 'language')
     if language:
-        new_book.set_language(str(language[0]) if isinstance(language, list) else str(language))
+        split_book.set_language(str(language[0]) if isinstance(language, list) else str(language))
     authors = book.get_metadata('DC', 'creator')
     for author_item in authors:
         if isinstance(author_item, tuple):
             author_name = author_item[0]
         else:
             author_name = str(author_item)
-        new_book.add_author(author_name)
+        split_book.add_author(author_name)
     print("Author", author_name)
 
     # Grab cover image from the first page of the entry to use as cover
@@ -211,11 +169,11 @@ def link_metadata(book, book_path, new_book, raw_content, entry):
         cover_image = book.get_item_with_href(cover_href)
         print(f"Found cover image: {cover_href}")
         if cover_image and cover_image.get_type() == ITEM_IMAGE:
-            new_book.set_cover(cover_href, cover_image.get_content())
+            split_book.set_cover(cover_href, cover_image.get_content())
 
-    return new_book
+    return split_book
 
-def link_resources(book, new_book, raw_content):
+def link_resources(book, split_book, raw_content):
     paths = set()
     # Find src attributes (images, audio, video)
     src_matches = re.findall(r'src="([^"]+)"', raw_content)
@@ -231,66 +189,70 @@ def link_resources(book, new_book, raw_content):
         item = book.get_item_with_href(path)
         if item:
             if item.get_type() is not ITEM_DOCUMENT:
-                existing_item = new_book.get_item_with_href(path)
+                existing_item = split_book.get_item_with_href(path)
                 if not existing_item:
-                    new_book.add_item(item)
+                    split_book.add_item(item)
 
-    return new_book
+    return split_book
+
+def generate_toc(book, start_index, end_index, flat_toc):
+    old_ncx = book.get_item_with_id('ncx')
+    soup = BeautifulSoup(old_ncx.get_content().decode('utf-8'), 'xml') if old_ncx else None
+    toc = []
+    if old_ncx:
+        for i in range(start_index, end_index + 1):
+            href = flat_toc[i]['href']
+            nav_point = soup.find('navPoint', {'content': href})
+            if nav_point and 'navLabel' in nav_point:
+                nav_label = nav_point.find('navLabel')
+                if nav_label:
+                    nav_label_text = nav_label.find('text')
+                    if nav_label_text:
+                        toc.append(epub.EpubHtml(title=nav_label_text.text, file_name=href))
+                        continue
+            toc.append(epub.EpubHtml(title=flat_toc[i]['title'], file_name=href))
+
+    # Ensure all items in the TOC have valid IDs
+    for idx, item in enumerate(toc):
+        if not item.get_id():
+            item.id = f"navPoint-{idx + 1}"
+
+    return toc
 
 def split_epub(book, book_path, flat_toc, selected_entries, output_folder):
     # Create a new ePUB file for each selected entry.
     for entry in selected_entries:
-        new_book = epub.EpubBook()
+        split_book = epub.EpubBook()
         title = entry['title']
-        new_book.set_title(title)
-        new_book.set_identifier(book.title + '-' + title.replace(' ', '_'))
+        split_book.set_title(title)
+        split_book.set_identifier(book.title + '-' + title.replace(' ', '_'))
 
         start_index = flat_toc.index(entry)
         end_index = calculate_end_index(flat_toc, start_index)
         for i in range(start_index, end_index + 1):
             item = book.get_item_with_href(flat_toc[i]['href'])
             if item and item.get_type() == ITEM_DOCUMENT:
-                new_book.add_item(item)
+                split_book.add_item(item)
                 raw_content = extract_raw_xhtml(book_path, flat_toc[i]['href'])
-                new_book = link_resources(book, new_book, raw_content)
+                split_book = link_resources(book, split_book, raw_content)
 
-        new_book = link_metadata(book, book_path, new_book, raw_content, entry)
+        split_book = link_metadata(book, book_path, split_book, raw_content, entry)
 
-        old_ncx = book.get_item_with_id('ncx')
-        soup = BeautifulSoup(old_ncx.get_content().decode('utf-8'), 'xml') if old_ncx else None
-        toc = []
-        if old_ncx:
-            for i in range(start_index, end_index + 1):
-                href = flat_toc[i]['href']
-                nav_point = soup.find('navPoint', {'content': href})
-                if nav_point and 'navLabel' in nav_point:
-                    nav_label = nav_point.find('navLabel')
-                    if nav_label:
-                        nav_label_text = nav_label.find('text')
-                        if nav_label_text:
-                            toc.append(epub.EpubHtml(title=nav_label_text.text, file_name=href))
-                            continue
-                toc.append(epub.EpubHtml(title=flat_toc[i]['title'], file_name=href))
+        split_book.toc = generate_toc(book, start_index, end_index, flat_toc)
+        split_book.add_item(epub.EpubNcx())
+        split_book.add_item(epub.EpubNav())
 
-        # Ensure all items in the TOC have valid IDs
-        for idx, item in enumerate(toc):
-            if not item.get_id():
-                item.id = f"navPoint-{idx + 1}"
-
-        new_book.toc = toc
-        new_book.add_item(epub.EpubNcx())
-        new_book.add_item(epub.EpubNav())
-
-        new_book.spine = [item for item in new_book.get_items() if item.get_type() == ITEM_DOCUMENT]
+        # Add the spine, optionally adding a navigation page
+        split_book.spine = [item for item in split_book.get_items() if item.get_type() == ITEM_DOCUMENT]
         if ADD_NAVIGATION:
-            new_book.spine.insert(NAVIGATION_INDEX, new_book.get_item_with_id('nav'))
+            split_book.spine.insert(NAVIGATION_INDEX, split_book.get_item_with_id('nav'))
 
         filename = re.sub(r'[\\/*?:"<>|]', "", title).strip() + ".epub"
         out_path = os.path.join(output_folder, filename)
 
         with tempfile.NamedTemporaryFile(delete=False, suffix='.epub') as temp_epub:
             temp_epub_path = temp_epub.name
-            epub.write_epub(temp_epub_path, new_book)
+            epub.write_epub(temp_epub_path, split_book)
 
         with zipfile.ZipFile(temp_epub_path, 'r') as temp_zip:
             with zipfile.ZipFile(out_path, 'w') as out_zip:
