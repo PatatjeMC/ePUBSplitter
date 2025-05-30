@@ -23,16 +23,12 @@ from urllib.parse import urlparse, unquote
 import zipfile
 import tempfile
 
-#CONFIG
-ADD_NAVIGATION = False
-NAVIGATION_INDEX = 2
-
 def pick_epub_file():
     root = tk.Tk()
     root.withdraw()
     file_path = filedialog.askopenfilename(
-        title="Select EPUB file",
-        filetypes=[("EPUB files", "*.epub")]
+        title="Select ePUB file",
+        filetypes=[("ePUB files", "*.epub")]
     )
     return file_path
 
@@ -171,7 +167,7 @@ def parse_selection(input_str, max_index):
     return sorted(selected)
 
 def extract_raw_xhtml(epub_path, xhtml_filename):
-    # Open the EPUB file as a ZIP archive
+    # Open the ePUB file as a ZIP archive
     with zipfile.ZipFile(epub_path, 'r') as epub_zip:
         # Detect the root folder dynamically
         root_folder = None
@@ -182,7 +178,7 @@ def extract_raw_xhtml(epub_path, xhtml_filename):
 
         # If the root folder is not found, raise an error
         if not root_folder:
-            raise FileNotFoundError(f"File '{xhtml_filename}' not found in EPUB archive.")
+            raise FileNotFoundError(f"File '{xhtml_filename}' not found in ePUB archive.")
 
         # Construct the full path to the XHTML file
         full_path = f"{root_folder}/{xhtml_filename}"
@@ -237,7 +233,7 @@ def link_resources(book, new_book, raw_content):
     return new_book
 
 def split_epub(book, book_path, flat_toc, selected_entries, output_folder):
-    # Create a new EPUB file for each selected entry.
+    # Create a new ePUB file for each selected entry.
     for entry in selected_entries:
         new_book = epub.EpubBook()
         title = entry['title']
@@ -283,8 +279,6 @@ def split_epub(book, book_path, flat_toc, selected_entries, output_folder):
         new_book.spine = [item for item in new_book.get_items() if item.get_type() == ITEM_DOCUMENT]
         if ADD_NAVIGATION:
             new_book.spine.insert(NAVIGATION_INDEX, new_book.get_item_with_id('nav'))
-
-        print(f"Saving {new_book.title} to {os.path.join(output_folder, f"{title}.epub")}")
 
         filename = re.sub(r'[\\/*?:"<>|]', "", title).strip() + ".epub"
         out_path = os.path.join(output_folder, filename)
@@ -368,12 +362,28 @@ if __name__ == "__main__":
     print("\nEnter the numbers of entries you want to INCLUDE, separated by commas.")
     print("You can use ranges (e.g. 1,3,5-7). Leave empty to select all.")
 
+    # Ask user to confirm settings
     user_input = input("Your selection: ").strip()
     if user_input == '' or user_input.lower() in ['all', 'a']:
         selected_indices = list(range(1, len(entries) + 1))
     else:
         selected_indices = parse_selection(user_input, len(entries))
 
+    # Ask user if they want to add a new navigation menu
+    add_nav = input("\nWould you like to add a new navigation menu to the split ePUBs? (y/n): ").strip().lower()
+    if add_nav in ['yes', 'y']:
+        global ADD_NAVIGATION
+        ADD_NAVIGATION = True
+        while True:
+            try:
+                nav_index = int(input("At which position in the spine should the navigation menu be inserted? (e.g. 2): "))
+                global NAVIGATION_INDEX
+                NAVIGATION_INDEX = nav_index
+                break
+            except ValueError:
+                print("⚠️ Invalid input. Please enter a number.")
+    else:
+        ADD_NAVIGATION = False
 
     selected_entries = [entries[i - 1] for i in selected_indices]
 
@@ -385,12 +395,12 @@ if __name__ == "__main__":
     for line in summary:
         print(line)
 
-    confirm = input("\nDo you want to proceed with splitting the EPUB? (y/n): ").strip().lower()
+    confirm = input("\nDo you want to proceed with splitting the ePUB? (y/n): ").strip().lower()
 
     if confirm not in ['yes', 'y']:
         print("❌ Operation cancelled. Exiting.")
         exit(0)
 
-    print(f"\nSplitting EPUB into {len(selected_entries)} parts...")
+    print(f"\nSplitting ePUB into {len(selected_entries)} parts...")
 
     split_epub(book, input_file, flat_toc, selected_entries, output_folder)
