@@ -192,9 +192,14 @@ def link_metadata(book, book_path, new_book, raw_content, entry):
     language = book.get_metadata('DC', 'language')
     if language:
         new_book.set_language(str(language[0]) if isinstance(language, list) else str(language))
-    author = book.get_metadata('DC', 'creator')
-    for author_item in author:
-        new_book.add_author(str(author_item) if isinstance(author_item, list) else str(author_item))
+    authors = book.get_metadata('DC', 'creator')
+    for author_item in authors:
+        if isinstance(author_item, tuple):
+            author_name = author_item[0]
+        else:
+            author_name = str(author_item)
+        new_book.add_author(author_name)
+    print("Author", author_name)
 
     # Grab cover image from the first page of the entry to use as cover
     cover_image = None
