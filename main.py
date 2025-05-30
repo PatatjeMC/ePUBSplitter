@@ -191,7 +191,7 @@ def extract_raw_xhtml(epub_path, xhtml_filename):
             f"Example files in archive: {epub_zip.namelist()[:5]}"
         )
 
-def link_metadata(book, book_path, split_book, raw_content, entry):
+def link_metadata(book, book_path, split_book, entry):
     language = book.get_metadata('DC', 'language')
     if language:
         split_book.set_language(str(language[0]) if isinstance(language, list) else str(language))
@@ -306,33 +306,96 @@ def link_resources(book, split_book, raw_content, document_canonical_href, proce
             
     return split_book
 
-def generate_toc(book, start_index, end_index, flat_toc):
-    old_ncx = book.get_item_with_id('ncx')
-    soup = BeautifulSoup(old_ncx.get_content().decode('utf-8'), 'xml') if old_ncx else None
-    toc = []
-    if old_ncx:
-        for i in range(start_index, end_index + 1):
-            href = flat_toc[i]['href']
-            nav_point = soup.find('navPoint', {'content': href})
-            if nav_point and 'navLabel' in nav_point:
-                nav_label = nav_point.find('navLabel')
-                if nav_label:
-                    nav_label_text = nav_label.find('text')
-                    if nav_label_text:
-                        toc.append(epub.EpubHtml(title=nav_label_text.text, file_name=href))
-                        continue
-            toc.append(epub.EpubHtml(title=flat_toc[i]['title'], file_name=href))
+def generate_toc(start_index, end_index, flat_toc):
+    hierarchical_toc = []
+    parent_lists_stack = [hierarchical_toc]
 
-    # Ensure all items in the TOC have valid IDs
-    for idx, item in enumerate(toc):
-        if not item.get_id():
-            item.id = f"navPoint-{idx + 1}"
+    if not flat_toc or start_index < 0 or start_index >= len(flat_toc) or \
+       end_index < start_index or end_index >= len(flat_toc):
+        if start_index >= 0 and start_index < len(flat_toc) and end_index >= len(flat_toc):
+            end_index = len(flat_toc) - 1
+        else:
+            return []
 
-    return toc
+    base_level_for_depth_calc = flat_toc[start_index]['level']
+    toc_item_counter = 0
+    level_shift_amount = 0
+
+    # Determine if a level shift is needed.
+    # This applies if the first item of the segment would be alone at its level,
+    # and subsequent items are all deeper.
+    if (start_index + 1) <= end_index: # Must have at least two items for a shift to be meaningful
+        first_item_original_level = flat_toc[start_index]['level']
+        second_item_original_level = flat_toc[start_index+1]['level']
+
+        if second_item_original_level > first_item_original_level:
+            # Check if the first item is the *only* one at its original level in this segment
+            first_item_is_solitary_at_its_level = True
+            for k_idx in range(start_index + 1, end_index + 1):
+                if flat_toc[k_idx]['level'] == first_item_original_level:
+                    first_item_is_solitary_at_its_level = False
+                    break
+            
+            if first_item_is_solitary_at_its_level:
+                # Calculate shift to make the second item a sibling of the first
+                level_shift_amount = second_item_original_level - first_item_original_level
+
+    for i_loop in range(start_index, end_index + 1):
+        current_entry_data = flat_toc[i_loop]
+        item_title = current_entry_data['title']
+        item_href = current_entry_data['href']
+
+        if not item_href:
+            print(f"⚠️ Skipping TOC entry '{item_title}' (original index {i_loop}) due to missing href.")
+            continue
+
+        original_item_level = current_entry_data['level']
+        item_level_for_hierarchy = original_item_level
+
+        if level_shift_amount > 0 and i_loop > start_index: # Apply shift only to items after the first
+            item_level_for_hierarchy = original_item_level - level_shift_amount
+            # Ensure adjusted level doesn't go below the very first item's original level (our base)
+            if item_level_for_hierarchy < base_level_for_depth_calc:
+                item_level_for_hierarchy = base_level_for_depth_calc
+        elif i_loop == start_index: # Ensure the first item itself uses its original level for hierarchy base
+             item_level_for_hierarchy = original_item_level
+
+
+        toc_item_counter += 1
+        toc_item_id = f"splitnav-{toc_item_counter}"
+        toc_item = epub.EpubHtml(title=item_title, file_name=item_href, uid=toc_item_id)
+
+        effective_depth = item_level_for_hierarchy - base_level_for_depth_calc
+        if effective_depth < 0: 
+            effective_depth = 0
+
+        while len(parent_lists_stack) > effective_depth + 1:
+            parent_lists_stack.pop()
+        
+        current_parent_list = parent_lists_stack[-1]
+        current_parent_list.append(toc_item)
+
+        is_parent_to_next = False
+        if (i_loop + 1) <= end_index:
+            next_item_original_level = flat_toc[i_loop+1]['level']
+            next_item_level_for_hierarchy = next_item_original_level
+            if level_shift_amount > 0 and (i_loop + 1) > start_index: 
+                next_item_level_for_hierarchy = next_item_original_level - level_shift_amount
+                if next_item_level_for_hierarchy < base_level_for_depth_calc:
+                     next_item_level_for_hierarchy = base_level_for_depth_calc
+            
+            # Compare with the current item's adjusted level for hierarchy
+            if next_item_level_for_hierarchy > item_level_for_hierarchy:
+                is_parent_to_next = True
+
+        if is_parent_to_next:
+            new_children_list = []
+            current_parent_list[-1] = (toc_item, new_children_list) 
+            parent_lists_stack.append(new_children_list)
+            
+    return hierarchical_toc
 
 def split_epub(book, book_path, flat_toc, selected_entries, output_folder):
-    processed_raw_content_for_metadata = ""
-
     # Create a new ePUB file for each selected entry.
     for entry in selected_entries:
         split_book = epub.EpubBook()
@@ -352,7 +415,6 @@ def split_epub(book, book_path, flat_toc, selected_entries, output_folder):
         current_spine_items = []
 
         for i in range(start_index, end_index + 1):
-            # doc_canonical_href is the full path like OEBPS/Text/file.xhtml
             doc_canonical_href = flat_toc[i]['href']
             if not doc_canonical_href:
                 print(f"⚠️ Skipping item with empty href at flat_toc index {i}, title: {flat_toc[i]['title']}")
@@ -370,7 +432,6 @@ def split_epub(book, book_path, flat_toc, selected_entries, output_folder):
                     try:
                         # Extract raw_content using the canonical href
                         raw_xhtml_content = extract_raw_xhtml(book_path, doc_canonical_href)
-                        processed_raw_content_for_metadata = raw_xhtml_content # Store for link_metadata
                         # Link resources using the canonical href of the current document
                         split_book = link_resources(book, split_book, raw_xhtml_content, doc_canonical_href, processed_resources_for_this_split_book)
                     except FileNotFoundError:
@@ -382,11 +443,11 @@ def split_epub(book, book_path, flat_toc, selected_entries, output_folder):
         
         # Link metadata using the entry (which contains the canonical href of its first page)
         if entry['href']: 
-             split_book = link_metadata(book, book_path, split_book, processed_raw_content_for_metadata, entry)
+             split_book = link_metadata(book, book_path, split_book, entry)
         else:
             print(f"ℹ️ Skipping metadata linking for entry '{title}' due to missing main href.")
 
-        split_book.toc = generate_toc(book, start_index, end_index, flat_toc) # generate_toc needs to use canonical hrefs
+        split_book.toc = generate_toc(start_index, end_index, flat_toc) # generate_toc needs to use canonical hrefs
         split_book.add_item(epub.EpubNcx())
         split_book.add_item(epub.EpubNav()) # EpubNav is for EPUB3 nav document
 
@@ -440,8 +501,6 @@ def split_epub(book, book_path, flat_toc, selected_entries, output_folder):
         os.remove(temp_epub_path)
 
         print(f"✅ Successfully created {filename} in {output_folder}")
-
-
 
 if __name__ == "__main__":
     input_file = pick_epub_file()
