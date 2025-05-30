@@ -15,13 +15,15 @@
 
 import tkinter as tk
 from tkinter import filedialog
-from ebooklib import epub, ITEM_DOCUMENT, ITEM_IMAGE
+from ebooklib import epub, ITEM_DOCUMENT, ITEM_IMAGE, ITEM_STYLE
 from bs4 import BeautifulSoup
 import os
 import re
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, urljoin
 import zipfile
 import tempfile
+import posixpath
+import collections
 
 _tk_root = None
 
@@ -54,13 +56,50 @@ def calculate_end_index(flat_toc, current_index):
             return i - 1
     return len(flat_toc) - 1
 
-
-def normalize_href(href):
+def normalize_canonical_href(href, base_href=None):
     if not href:
         return ''
-    parsed = urlparse(href)
-    unqouted = unquote(parsed.path)
-    return unqouted.lstrip('../')
+
+    # 1. Unquote percent-encoding (e.g., %20 to space)
+    cleaned_href = unquote(href)
+    
+    # 2. Remove URL fragment (e.g., #section1)
+    cleaned_href = cleaned_href.split('#', 1)[0]
+
+    # 3. If base_href is provided, join it with the href
+    if base_href:
+        # Ensure base_href itself is clean and acts like a directory for urljoin
+        # For urljoin, base_href should end with / if it's a directory path
+        # Example: base_href = "OEBPS/Text/chapter.xhtml"
+        # We want to resolve relative to "OEBPS/Text/"
+        # So, we can take posixpath.dirname(base_href) and add a slash
+        base_dir = posixpath.dirname(base_href)
+        if not base_dir.endswith('/'):
+            base_dir += '/'
+        # urljoin needs a full "URL-like" base, so we make it pseudo-absolute for joining
+        # This ensures ../ are resolved correctly from the base_dir
+        pseudo_absolute_base = f"file:///{base_dir}"
+        resolved_url = urljoin(pseudo_absolute_base, cleaned_href)
+        # Extract path part after file:///
+        normalized_path = urlparse(resolved_url).path
+        # Remove leading slash that urlparse.path might give for file URLs
+        if normalized_path.startswith('/'):
+            normalized_path = normalized_path[1:]
+    else:
+        normalized_path = cleaned_href
+    
+    # 4. Normalize path using posixpath to handle ".", "..", and multiple slashes,
+    #    preserving forward slashes, which are standard in EPUBs.
+    #    Example: "OEBPS/Text/../Images/img.jpg" -> "OEBPS/Images/img.jpg"
+    normalized_path = posixpath.normpath(normalized_path)
+    
+    # 5. Remove leading slash if normpath added one (e.g. if original path was /OEBPS/...)
+    #    or if it resulted from resolving an absolute-looking path.
+    #    EPUB internal paths are typically relative to the archive root (e.g., "OEBPS/file.xhtml")
+    if normalized_path.startswith('/'):
+        normalized_path = normalized_path[1:]
+        
+    return normalized_path
 
 def flatten_toc(toc, level=1, results=None):
     if results is None:
@@ -82,7 +121,8 @@ def flatten_toc(toc, level=1, results=None):
     for item in toc:
         href, title = extract_href_and_title(item)
         if title:
-            results.append({'level': level, 'title': title, 'href': normalize_href(href), 'last_href': None})
+            canonical_doc_href = normalize_canonical_href(href)
+            results.append({'level': level, 'title': title, 'href': canonical_doc_href, 'last_href': None})
         if hasattr(item, 'subitems'):
             flatten_toc(item.subitems, level + 1, results)
         elif isinstance(item, tuple):
@@ -93,7 +133,7 @@ def flatten_toc(toc, level=1, results=None):
     last_href = None
     for entry in reversed(results):
         if entry['href']:
-            last_href = normalize_href(entry['href'])
+            last_href = entry['href']
         entry['last_href'] = last_href
 
     return results
@@ -127,72 +167,143 @@ def parse_selection(input_str, max_index):
 def extract_raw_xhtml(epub_path, xhtml_filename):
     # Open the ePUB file as a ZIP archive
     with zipfile.ZipFile(epub_path, 'r') as epub_zip:
-        # Detect the root folder dynamically
-        root_folder = None
-        for file_name in epub_zip.namelist():
-            if file_name.endswith(xhtml_filename):
-                root_folder = file_name.split('/')[0]
-                break
-
-        # If the root folder is not found, raise an error
-        if not root_folder:
-            raise FileNotFoundError(f"File '{xhtml_filename}' not found in ePUB archive.")
-
-        # Construct the full path to the XHTML file
-        full_path = f"{root_folder}/{xhtml_filename}"
-
-        # Read the raw content of the XHTML file
-        raw_content = epub_zip.read(full_path).decode('utf-8', errors='ignore')
-
-        return raw_content
+        # Attempt 1: xhtml_filename (from normalize_href) is the exact path
+        try:
+            # Ensure xhtml_filename is treated as a string, in case it's None or other type unexpectedly
+            if not isinstance(xhtml_filename, str) or not xhtml_filename:
+                raise KeyError("Invalid xhtml_filename provided")
+            return epub_zip.read(xhtml_filename).decode('utf-8', errors='ignore')
+        except KeyError:
+            # Attempt 2: Find a file in the archive that ends with xhtml_filename.
+            # This handles cases where xhtml_filename might be just a basename,
+            # or if normalize_href didn't produce an exact match for some reason.
+            # It also guards against xhtml_filename being None or empty.
+            if isinstance(xhtml_filename, str) and xhtml_filename:
+                for actual_path_in_zip in epub_zip.namelist():
+                    if actual_path_in_zip.endswith(xhtml_filename):
+                        # If found, actual_path_in_zip is the correct path to use
+                        return epub_zip.read(actual_path_in_zip).decode('utf-8', errors='ignore')
+        
+        # If neither attempt found the file, or xhtml_filename was invalid
+        raise FileNotFoundError(
+            f"File '{xhtml_filename}' not found in ePUB archive. "
+            f"Checked for exact match and suffix match. "
+            f"Example files in archive: {epub_zip.namelist()[:5]}"
+        )
 
 def link_metadata(book, book_path, split_book, raw_content, entry):
     language = book.get_metadata('DC', 'language')
     if language:
         split_book.set_language(str(language[0]) if isinstance(language, list) else str(language))
     authors = book.get_metadata('DC', 'creator')
+    author_name = None
     for author_item in authors:
         if isinstance(author_item, tuple):
             author_name = author_item[0]
         else:
             author_name = str(author_item)
-        split_book.add_author(author_name)
-    print("Author", author_name)
+        if author_name:
+            split_book.add_author(author_name)
 
-    # Grab cover image from the first page of the entry to use as cover
-    cover_image = None
-    page = book.get_item_with_href(entry['href'])
-    soup = BeautifulSoup(extract_raw_xhtml(book_path, page.get_name() if page else entry['href']), 'html.parser')
+    # Grab cover image
+    # entry['href'] should be the canonical href of the first XHTML page of this section
+    first_page_canonical_href = entry['href']
+    if not first_page_canonical_href:
+        print(f"⚠️ Entry '{entry['title']}' has no valid href, cannot extract cover.")
+        return split_book
+
+    try:
+        # We need the raw content of the *specific first page* for its image tags
+        cover_page_raw_content = extract_raw_xhtml(book_path, first_page_canonical_href)
+    except FileNotFoundError:
+        print(f"⚠️ Could not extract raw content for cover search from: {first_page_canonical_href}")
+        return split_book
+        
+    soup = BeautifulSoup(cover_page_raw_content, 'html.parser')
     img_tag = soup.find('img')
     if img_tag and 'src' in img_tag.attrs:
-        cover_href = normalize_href(img_tag['src'])
-        cover_image = book.get_item_with_href(cover_href)
-        print(f"Found cover image: {cover_href}")
-        if cover_image and cover_image.get_type() == ITEM_IMAGE:
-            split_book.set_cover(cover_href, cover_image.get_content())
-
+        relative_cover_src = img_tag['src']
+        
+        # Resolve and normalize the cover image src relative to the first page's canonical href
+        canonical_cover_href = normalize_canonical_href(relative_cover_src, base_href=first_page_canonical_href)
+        
+        cover_image_item = book.get_item_with_href(canonical_cover_href)
+        if cover_image_item and cover_image_item.get_type() == ITEM_IMAGE:
+            print(f"Found cover image: {canonical_cover_href} (from {relative_cover_src})")
+            # Use the item's file_name (which should be canonical) and content
+            # ebooklib's set_cover uses the item's file_name as the href in the OPF
+            split_book.set_cover(cover_image_item.file_name, cover_image_item.get_content())
+            # Ensure the cover image item itself is also added to the book's items if not already
+            if not split_book.get_item_with_href(cover_image_item.file_name):
+                 split_book.add_item(cover_image_item)
+        elif cover_image_item:
+            print(f"⚠️ Found item for cover '{canonical_cover_href}', but it's not an image (type: {cover_image_item.get_type()}).")
+        else:
+            print(f"⚠️ Could not find cover image item in book for resolved href: '{canonical_cover_href}' (from '{relative_cover_src}' in '{first_page_canonical_href}')")
     return split_book
 
-def link_resources(book, split_book, raw_content):
-    paths = set()
-    # Find src attributes (images, audio, video)
+def link_resources(book, split_book, raw_content, document_canonical_href, processed_resources_global):
+    queue = collections.deque()
+    
+    # Find initial paths from the current raw_content (e.g., from an XHTML file)
+    # These are relative to document_canonical_href
+    initial_relative_paths = []
     src_matches = re.findall(r'src="([^"]+)"', raw_content)
-    # Find href attributes (stylesheets, fonts)
-    href_matches = re.findall(r'href="([^"]+)"', raw_content)
+    href_matches = re.findall(r'href="([^"]+)"', raw_content) # In XHTML, this primarily gets <link rel="stylesheet">
+    css_url_matches = re.findall(r'url\s*\(\s*[\'"]?([^\'"\)]+)[\'"]?\s*\)', raw_content)
+    initial_relative_paths.extend(src_matches)
+    initial_relative_paths.extend(href_matches)
+    initial_relative_paths.extend(css_url_matches)
 
-    for match in src_matches + href_matches:
-        match = normalize_href(match)
-        if match:
-            paths.add(match)
+    for relative_path_match in initial_relative_paths:
+        if not relative_path_match or relative_path_match.startswith(('data:', 'http:', 'https:')):
+            continue
 
-    for path in paths:
-        item = book.get_item_with_href(path)
+        # Resolve path relative to the current document (XHTML or CSS)
+        final_lookup_path = normalize_canonical_href(relative_path_match, base_href=document_canonical_href)
+        
+        if final_lookup_path and final_lookup_path not in processed_resources_global:
+            # Check if item exists before adding to queue to avoid processing non-existent items later
+            prospective_item = book.get_item_with_href(final_lookup_path)
+            if prospective_item:
+                queue.append(final_lookup_path)
+                processed_resources_global.add(final_lookup_path) # Mark as processed/queued
+
+    while queue:
+        current_resource_href = queue.popleft()
+        item = book.get_item_with_href(current_resource_href)
+
         if item:
-            if item.get_type() is not ITEM_DOCUMENT:
-                existing_item = split_book.get_item_with_href(path)
-                if not existing_item:
-                    split_book.add_item(item)
+            # Add the item to the split book if not already there
+            if not split_book.get_item_with_href(item.file_name):
+                split_book.add_item(item)
 
+            # If the item is a CSS file, parse it for more resources
+            is_css = (item.get_type() == ITEM_STYLE or 
+                      (hasattr(item, 'media_type') and item.media_type == 'text/css'))
+
+            if is_css:
+                try:
+                    css_content = item.get_content().decode('utf-8', errors='ignore')
+                    css_internal_url_matches = re.findall(r'url\s*\(\s*[\'"]?([^\'"\)]+)[\'"]?\s*\)', css_content)
+                    
+                    for relative_path_in_css in css_internal_url_matches:
+                        if not relative_path_in_css or relative_path_in_css.startswith(('data:', 'http:', 'https:')):
+                            continue
+                        
+                        # Resolve path relative to the CSS file's location (current_resource_href)
+                        linked_item_href = normalize_canonical_href(relative_path_in_css, base_href=current_resource_href)
+                        
+                        if linked_item_href and linked_item_href not in processed_resources_global:
+                            prospective_linked_item = book.get_item_with_href(linked_item_href)
+                            if prospective_linked_item:
+                                queue.append(linked_item_href) 
+                                processed_resources_global.add(linked_item_href)
+                except Exception as e:
+                    print(f"⚠️ Error processing CSS content for {current_resource_href}: {e}")
+        else:
+            print(f"⚠️ Resource not found in original EPUB when processing queue: '{current_resource_href}'")
+            
     return split_book
 
 def generate_toc(book, start_index, end_index, flat_toc):
@@ -220,6 +331,8 @@ def generate_toc(book, start_index, end_index, flat_toc):
     return toc
 
 def split_epub(book, book_path, flat_toc, selected_entries, output_folder):
+    processed_raw_content_for_metadata = ""
+
     # Create a new ePUB file for each selected entry.
     for entry in selected_entries:
         split_book = epub.EpubBook()
@@ -227,25 +340,64 @@ def split_epub(book, book_path, flat_toc, selected_entries, output_folder):
         split_book.set_title(title)
         split_book.set_identifier(book.title + '-' + title.replace(' ', '_'))
 
-        start_index = flat_toc.index(entry)
+        processed_resources_for_this_split_book = set()
+
+        try:
+            start_index = next(i for i, ft_entry in enumerate(flat_toc) if ft_entry['href'] == entry['href'] and ft_entry['title'] == entry['title'])
+        except StopIteration:
+            print(f"⚠️ Could not find entry '{title}' (href: {entry['href']}) in flat_toc. Skipping.")
+            continue
         end_index = calculate_end_index(flat_toc, start_index)
+
+        current_spine_items = []
+
         for i in range(start_index, end_index + 1):
-            item = book.get_item_with_href(flat_toc[i]['href'])
-            if item and item.get_type() == ITEM_DOCUMENT:
-                split_book.add_item(item)
-                raw_content = extract_raw_xhtml(book_path, flat_toc[i]['href'])
-                split_book = link_resources(book, split_book, raw_content)
+            # doc_canonical_href is the full path like OEBPS/Text/file.xhtml
+            doc_canonical_href = flat_toc[i]['href']
+            if not doc_canonical_href:
+                print(f"⚠️ Skipping item with empty href at flat_toc index {i}, title: {flat_toc[i]['title']}")
+                continue
 
-        split_book = link_metadata(book, book_path, split_book, raw_content, entry)
+            original_item = book.get_item_with_href(doc_canonical_href)
+            if original_item:
+                # Add the item to the split book. ebooklib uses original_item.file_name for the path.
+                # original_item.file_name should be the same as doc_canonical_href if retrieved correctly.
+                if not split_book.get_item_with_href(original_item.file_name):
+                    split_book.add_item(original_item)
+                
+                if original_item.get_type() == ITEM_DOCUMENT:
+                    current_spine_items.append(original_item) # Add to spine list for this book
+                    try:
+                        # Extract raw_content using the canonical href
+                        raw_xhtml_content = extract_raw_xhtml(book_path, doc_canonical_href)
+                        processed_raw_content_for_metadata = raw_xhtml_content # Store for link_metadata
+                        # Link resources using the canonical href of the current document
+                        split_book = link_resources(book, split_book, raw_xhtml_content, doc_canonical_href, processed_resources_for_this_split_book)
+                    except FileNotFoundError:
+                        print(f"⚠️ Could not extract/link resources for: {doc_canonical_href}")
+                # else: (item is not a document but was in flat_toc, e.g. an image as a TOC entry)
+                #   It's already added if it's a resource. If it was meant for spine, that's unusual.
+            else:
+                print(f"⚠️ Could not find item for href: {doc_canonical_href} from flat_toc index {i}")
+        
+        # Link metadata using the entry (which contains the canonical href of its first page)
+        if entry['href']: 
+             split_book = link_metadata(book, book_path, split_book, processed_raw_content_for_metadata, entry)
+        else:
+            print(f"ℹ️ Skipping metadata linking for entry '{title}' due to missing main href.")
 
-        split_book.toc = generate_toc(book, start_index, end_index, flat_toc)
+        split_book.toc = generate_toc(book, start_index, end_index, flat_toc) # generate_toc needs to use canonical hrefs
         split_book.add_item(epub.EpubNcx())
-        split_book.add_item(epub.EpubNav())
+        split_book.add_item(epub.EpubNav()) # EpubNav is for EPUB3 nav document
 
-        # Add the spine, optionally adding a navigation page
-        split_book.spine = [item for item in split_book.get_items() if item.get_type() == ITEM_DOCUMENT]
-        if ADD_NAVIGATION:
-            split_book.spine.insert(NAVIGATION_INDEX, split_book.get_item_with_id('nav'))
+        # Set the spine using the collected document items for this split book
+        split_book.spine = current_spine_items
+        if ADD_NAVIGATION and split_book.get_item_with_id('nav'): # Check if nav item exists
+            # Ensure NAVIGATION_INDEX is valid for the current spine length
+            nav_insert_pos = min(NAVIGATION_INDEX, len(split_book.spine))
+            split_book.spine.insert(nav_insert_pos, split_book.get_item_with_id('nav'))
+        elif ADD_NAVIGATION:
+            print("⚠️ Requested to add navigation, but 'nav' item not found in split book.")
 
         filename = re.sub(r'[\\/*?:"<>|]', "", title).strip() + ".epub"
         out_path = os.path.join(output_folder, filename)
